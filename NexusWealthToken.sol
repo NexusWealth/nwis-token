@@ -12,7 +12,8 @@ import "@openzeppelin/contracts/utils/Nonces.sol";
 
 /**
  * @title NexusWealthToken
- * @notice ERC20 with governance, bridge, blacklist, blacklist operators, supported chains, and supply cap.
+ * @notice ERC20 with governance, blacklist, and PRESALE PAUSE functionality.
+ * @dev Enhanced with presale-specific pause that allows purchases but blocks transfers
  * Compatible with OpenZeppelin Contracts v5.x
  */
 contract NexusWealthToken is
@@ -31,30 +32,20 @@ contract NexusWealthToken is
 
     mapping(address => bool) public isBlacklisted;
 
-    uint256 public maxBridgeAmount;
-    uint256 public bridgeFee;
-    uint256 public bridgeFeesCollected;
-    mapping(address => bool) public bridgeOperators;
-
     // === Blacklist Operators ===
     mapping(address => bool) public blacklistOperators;
     event BlacklistOperatorUpdated(address indexed operator, bool status);
+    event AddressBlacklisted(address indexed user, bool status);
 
-    // === Supported Chains ===
-    mapping(uint256 => bool) public supportedChains;
-    event SupportedChainUpdated(uint256 indexed chainId, bool supported);
-
-    struct BridgeRequest {
-        address from;
-        address to;
-        uint256 amount;
-        uint256 fee;
-        bool processed;
-        bool canceled;
-    }
-
-    mapping(uint256 => BridgeRequest) public bridgeRequests;
-    uint256 public bridgeRequestCount;
+    // === Presale Pause Feature ===
+    bool public presalePauseEnabled;
+    address public presaleContract;
+    mapping(address => bool) public presalePauseWhitelist;
+    
+    event PresalePauseEnabled();
+    event PresalePauseDisabled();
+    event PresaleContractUpdated(address indexed oldContract, address indexed newContract);
+    event PresalePauseWhitelistUpdated(address indexed account, bool status);
 
     enum VoteType { Against, For, Abstain }
 
@@ -80,11 +71,7 @@ contract NexusWealthToken is
     uint256 public votingPeriod;
     uint256 public quorumNumerator;
     uint256 public constant QUORUM_DENOMINATOR = 10_000;
-
-    event BridgeInitiated(uint256 indexed requestId, address indexed from, uint256 amount, uint256 fee);
-    event BridgeProcessed(uint256 indexed requestId, address indexed to, uint256 amount);
-    event BridgeCanceled(uint256 indexed requestId, address indexed by);
-    event BridgeFeesWithdrawn(address indexed to, uint256 amount);
+    uint256 public constant MAX_BATCH_SIZE = 100;
 
     event ProposalCreated(uint256 indexed id, address indexed proposer, uint256 snapshotBlock, uint256 startBlock, uint256 endBlock, string description);
     event VoteCast(uint256 indexed id, address indexed voter, VoteType support, uint256 weight);
@@ -108,25 +95,81 @@ contract NexusWealthToken is
         _mint(msg.sender, _initialSupply * 10 ** _customDecimals);
         totalMinted = _initialSupply * 10 ** _customDecimals;
 
-        maxBridgeAmount = 50_000_000 * 10 ** _customDecimals;
-        bridgeFee = 0;
-
         proposalThreshold = 0;
         votingDelay = 0;
         votingPeriod = 45_000;
         quorumNumerator = 400;
+        
+        // Initialize presale pause as disabled
+        presalePauseEnabled = false;
     }
 
     // ===== Admin setters =====
-    function setBridgeOperator(address operator, bool status) external onlyOwner { bridgeOperators[operator] = status; }
-    function setBridgeFee(uint256 newFeeWei) external onlyOwner { bridgeFee = newFeeWei; }
     function setBlacklistOperator(address operator, bool status) external onlyOwner {
         blacklistOperators[operator] = status;
         emit BlacklistOperatorUpdated(operator, status);
     }
-    function setSupportedChain(uint256 chainId, bool status) external onlyOwner {
-        supportedChains[chainId] = status;
-        emit SupportedChainUpdated(chainId, status);
+
+    // ===== Presale Pause Functions =====
+    /**
+     * @notice Set the presale contract address
+     * @param _presaleContract Address of the presale contract
+     */
+    function setPresaleContract(address _presaleContract) external onlyOwner {
+        require(_presaleContract != address(0), "Zero address not allowed");
+        address oldContract = presaleContract;
+        presaleContract = _presaleContract;
+        emit PresaleContractUpdated(oldContract, _presaleContract);
+    }
+
+    /**
+     * @notice Enable presale pause mode - allows only presale purchases, blocks transfers
+     */
+    function enablePresalePause() external onlyOwner {
+        require(presaleContract != address(0), "Presale contract not set");
+        presalePauseEnabled = true;
+        emit PresalePauseEnabled();
+    }
+
+    /**
+     * @notice Disable presale pause mode - re-enables normal transfers
+     */
+    function disablePresalePause() external onlyOwner {
+        presalePauseEnabled = false;
+        emit PresalePauseDisabled();
+    }
+
+    /**
+     * @notice Add or remove address from presale pause whitelist
+     * @param account Address to whitelist/unwhitelist
+     * @param status True to whitelist, false to remove
+     */
+    function setPresalePauseWhitelist(address account, bool status) external onlyOwner {
+        require(account != address(0), "Cannot whitelist zero address");
+        presalePauseWhitelist[account] = status;
+        emit PresalePauseWhitelistUpdated(account, status);
+    }
+
+    /**
+     * @notice Batch whitelist multiple addresses
+     * @param accounts Array of addresses to whitelist
+     * @param status True to whitelist all, false to remove all
+     */
+    function setPresalePauseWhitelistBatch(address[] calldata accounts, bool status) external onlyOwner {
+        require(accounts.length > 0 && accounts.length <= MAX_BATCH_SIZE, "Invalid batch size");
+        
+        for (uint256 i = 0; i < accounts.length; i++) {
+            require(accounts[i] != address(0), "Zero address in batch");
+            presalePauseWhitelist[accounts[i]] = status;
+            emit PresalePauseWhitelistUpdated(accounts[i], status);
+        }
+    }
+
+    /**
+     * @notice Check if presale pause is active
+     */
+    function isPresalePaused() external view returns (bool) {
+        return presalePauseEnabled;
     }
 
     // ===== Blacklist management =====
@@ -136,7 +179,9 @@ contract NexusWealthToken is
     }
 
     function setBlacklistStatus(address user, bool status) external onlyBlacklistAdmin {
+        require(user != address(0), "Cannot blacklist zero address");
         isBlacklisted[user] = status;
+        emit AddressBlacklisted(user, status);
     }
 
     // ===== ERC20 controls =====
@@ -144,56 +189,35 @@ contract NexusWealthToken is
     function pause() external onlyOwner { _pause(); }
     function unpause() external onlyOwner { _unpause(); }
 
+    /**
+     * @notice Mint new tokens (up to maxSupply)
+     * @param to Address to receive minted tokens
+     * @param amount Amount of tokens to mint
+     */
     function mint(address to, uint256 amount) external onlyOwner {
+        require(to != address(0), "Cannot mint to zero address");
         require(totalSupply() + amount <= maxSupply, "Exceeds max supply");
         _mint(to, amount);
         totalMinted += amount;
     }
 
-    // ===== Bridge =====
-    function initiateBridge(address to, uint256 amount, uint256 targetChainId) external payable nonReentrant whenNotPaused {
-        require(!isBlacklisted[msg.sender], "Blacklisted");
-        require(amount <= maxBridgeAmount, "Exceeds bridge cap");
-        require(msg.value >= bridgeFee, "Insufficient fee");
-        require(supportedChains[targetChainId], "Chain not supported");
-
-        _burn(msg.sender, amount);
+    /**
+     * @notice Burn tokens (inherited from ERC20Burnable)
+     * @dev Users can burn their own tokens, reduces total supply
+     */
+    function burn(uint256 amount) public override {
+        super.burn(amount);
         totalBurned += amount;
-
-        bridgeRequestCount++;
-        bridgeRequests[bridgeRequestCount] = BridgeRequest(msg.sender, to, amount, msg.value, false, false);
-
-        bridgeFeesCollected += msg.value;
-        emit BridgeInitiated(bridgeRequestCount, msg.sender, amount, msg.value);
     }
 
-    function processBridge(uint256 requestId) external nonReentrant {
-        require(bridgeOperators[msg.sender], "Not operator");
-        BridgeRequest storage r = bridgeRequests[requestId];
-        require(!r.processed && !r.canceled, "Finalized");
-
-        r.processed = true;
-        _mint(r.to, r.amount);
-        totalMinted += r.amount;
-        emit BridgeProcessed(requestId, r.to, r.amount);
-    }
-
-    function cancelBridge(uint256 requestId) external {
-        BridgeRequest storage r = bridgeRequests[requestId];
-        require(r.from != address(0), "Invalid");
-        require(!r.processed && !r.canceled, "Finalized");
-        require(msg.sender == r.from || msg.sender == owner(), "Not authorized");
-        r.canceled = true;
-        emit BridgeCanceled(requestId, msg.sender);
-    }
-
-    function withdrawBridgeFees(address to, uint256 amount) external onlyOwner {
-        require(to != address(0), "Zero address");
-        require(amount <= bridgeFeesCollected, "Insufficient");
-        bridgeFeesCollected -= amount;
-        (bool ok, ) = payable(to).call{value: amount}("");
-        require(ok, "ETH transfer failed");
-        emit BridgeFeesWithdrawn(to, amount);
+    /**
+     * @notice Burn tokens from another account (requires allowance)
+     * @param account Address to burn tokens from
+     * @param amount Amount of tokens to burn
+     */
+    function burnFrom(address account, uint256 amount) public override {
+        super.burnFrom(account, amount);
+        totalBurned += amount;
     }
 
     // ===== Governance API =====
@@ -205,7 +229,11 @@ contract NexusWealthToken is
         external
         onlyOwner
     {
-        require(_quorumNumerator <= QUORUM_DENOMINATOR, "quorum too high");
+        require(_quorumNumerator >= 100 && _quorumNumerator <= QUORUM_DENOMINATOR, "Invalid quorum");
+        require(_period >= 6_500 && _period <= 200_000, "Invalid period");
+        require(_delay <= 50_000, "Delay too long");
+        require(_threshold <= maxSupply / 100, "Threshold too high");
+        
         proposalThreshold = _threshold;
         votingDelay = _delay;
         votingPeriod = _period;
@@ -276,8 +304,26 @@ contract NexusWealthToken is
         internal
         override(ERC20, ERC20Pausable, ERC20Votes)
     {
+        // Check blacklist first
         if (from != address(0)) require(!isBlacklisted[from], "Sender blacklisted");
         if (to != address(0)) require(!isBlacklisted[to], "Recipient blacklisted");
+        
+        // Check presale pause mode (only if not fully paused)
+        if (presalePauseEnabled && !paused()) {
+            // Allow minting (from == address(0)) and burning (to == address(0))
+            if (from != address(0) && to != address(0)) {
+                // Check if this is an allowed transfer during presale pause
+                bool isPresaleTransfer = (from == presaleContract);
+                bool isSenderWhitelisted = presalePauseWhitelist[from];
+                bool isRecipientWhitelisted = presalePauseWhitelist[to];
+                
+                require(
+                    isPresaleTransfer || isSenderWhitelisted || isRecipientWhitelisted,
+                    "Transfers paused: presale only"
+                );
+            }
+        }
+        
         super._update(from, to, value);
     }
 
